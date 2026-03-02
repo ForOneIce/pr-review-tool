@@ -1,0 +1,42 @@
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=Space+Grotesk:wght@500;700&display=swap");
+@import "tailwindcss";
+
+:root {
+  --bg-ink: #0f1720;
+  --bg-paper: #f6f2e8;
+  --card: #fffaf1;
+  --line: #d9cfbc;
+  --text-strong: #1f2a37;
+  --text-soft: #5f6b75;
+  --accent: #d97706;
+  --accent-soft: #f7dfb0;
+  --ok: #1f7a54;
+  --warn: #c2410c;
+  --danger: #b42318;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Noto Sans SC", sans-serif;
+  color: var(--text-strong);
+  background:
+    radial-gradient(circle at 10% 15%, #f8e5bc 0, transparent 30%),
+    radial-gradient(circle at 90% 0%, #d9f2ec 0, transparent 28%),
+    linear-gradient(150deg, #f7f3ea 0%, #eef2f7 100%);
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
