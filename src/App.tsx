@@ -32,12 +32,34 @@ type GitHubPullFile = {
   blob_url: string;
 };
 type GitHubIssueComment = { body: string };
+type GitHubIssueCommentDetail = {
+  id: number;
+  body: string;
+  created_at: string;
+  user: { login: string } | null;
+};
 type GitHubReview = {
   id: number;
   body: string | null;
   state: string;
   submitted_at: string | null;
   user: { login: string } | null;
+};
+type GitHubPullReviewComment = {
+  id: number;
+  body: string;
+  created_at: string;
+  user: { login: string } | null;
+  path?: string;
+};
+type ReviewTimelineItem = {
+  id: string;
+  author: string;
+  body: string;
+  at: string;
+  kind: "review" | "issue_comment" | "code_comment";
+  state?: string;
+  path?: string;
 };
 type PullMeta = {
   day: number | null;
@@ -46,6 +68,8 @@ type PullMeta = {
   reviewed: boolean;
   latestReviewedAt: string | null;
   mergedBy: string | null;
+  closedBy: string | null;
+  closedAt: string | null;
 };
 type DayRecord = {
   day: number;
@@ -59,6 +83,12 @@ type GitHubIssueEvent = {
   actor?: { login: string } | null;
 };
 
+type PrActors = {
+  mergedBy: string | null;
+  closedBy: string | null;
+  closedAt: string | null;
+};
+
 const TOTAL_DAYS = 30;
 const STORAGE_TOKEN_KEY = "www65_teacher_token";
 const STORAGE_REPO_KEY = "www65_repo_name";
@@ -69,8 +99,8 @@ const praiseTemplates = ["思路清晰，代码结构非常工整，继续保持
 const errorTemplates = ["提交超时", "编译失败未通过", "不符合题目要求", "空文件", "代码与标题内容不符", "改动冲突", "修改了其他人的文件结构"];
 const suggestionTemplates = ["建议补充测试用例，覆盖边界输入场景。", "可进一步优化时间复杂度，尝试减少重复计算。", "建议拆分函数职责，提升代码可维护性。", "可以补充关键步骤注释，便于后续复盘。", "建议统一变量命名风格，增强可读性。"];
 const reviewActionTips: Record<ReviewAction, string> = {
-  APPROVE: "批注并通过：会提交 Review 并标记为 Approve，表示本次作业评审通过。",
-  REQUEST_CHANGES: "请求修改：会提交 Review 并要求学员修改后再看，PR 会显示 changes requested。",
+  APPROVE: "批注并通过：会提交 Review（Approve）并尝试自动合并 PR，成功后会进入“我已批改已合并通过”。",
+  REQUEST_CHANGES: "关闭PR：会先提交评语，然后直接关闭 PR（不合并），用于拒绝本次提交。",
   COMMENT: "仅评论：只留下评语，不改变通过/请求修改状态，适合补充建议或追问。",
 };
 
@@ -140,6 +170,11 @@ function toReadableCodePreview(patch?: string) {
   }
   return cleaned.join("\n").trim();
 }
+function reviewKindLabel(kind: ReviewTimelineItem["kind"]) {
+  if (kind === "review") return "Review";
+  if (kind === "code_comment") return "代码评论";
+  return "普通评论";
+}
 
 async function githubFetch<T>(token: string, path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`https://api.github.com${path}`, {
@@ -168,12 +203,17 @@ async function fetchAllPages<T>(token: string, pathBuilder: (page: number) => st
   }
   return rows;
 }
-async function fetchMergedBy(token: string, owner: string, repo: string, prNumber: number) {
+async function fetchPrActors(token: string, owner: string, repo: string, prNumber: number): Promise<PrActors> {
   const events = await fetchAllPages<GitHubIssueEvent>(token, (page) => `/repos/${owner}/${repo}/issues/${prNumber}/events?per_page=100&page=${page}`);
   const mergedEvents = events.filter((event) => event.event === "merged" && event.actor?.login);
-  if (mergedEvents.length === 0) return null;
+  const closedEvents = events.filter((event) => event.event === "closed" && event.actor?.login);
   mergedEvents.sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime());
-  return mergedEvents[0].actor?.login ?? null;
+  closedEvents.sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime());
+  return {
+    mergedBy: mergedEvents[0]?.actor?.login ?? null,
+    closedBy: closedEvents[0]?.actor?.login ?? null,
+    closedAt: closedEvents[0]?.created_at ?? null,
+  };
 }
 
 export function App() {
@@ -195,6 +235,16 @@ export function App() {
   const [prFiles, setPrFiles] = useState<GitHubPullFile[]>([]);
   const [prDetailLoading, setPrDetailLoading] = useState(false);
   const [prDetailError, setPrDetailError] = useState("");
+  const [reviewTimeline, setReviewTimeline] = useState<ReviewTimelineItem[]>([]);
+  const [reviewTimelineLoading, setReviewTimelineLoading] = useState(false);
+  const [reviewTimelineError, setReviewTimelineError] = useState("");
+  const [detailReviews, setDetailReviews] = useState<GitHubReview[]>([]);
+  const [detailReviewsLoading, setDetailReviewsLoading] = useState(false);
+  const [detailReviewsError, setDetailReviewsError] = useState("");
+  const [detailIssueComments, setDetailIssueComments] = useState<GitHubIssueCommentDetail[]>([]);
+  const [detailCodeComments, setDetailCodeComments] = useState<GitHubPullReviewComment[]>([]);
+  const [detailCommentsLoading, setDetailCommentsLoading] = useState(false);
+  const [detailCommentsError, setDetailCommentsError] = useState("");
   const [copiedFile, setCopiedFile] = useState("");
 
   const [historyTemplates, setHistoryTemplates] = useState<string[]>([]);
@@ -204,25 +254,270 @@ export function App() {
   const [owner, repoName] = repo.split("/");
 
   const pullsWithMeta = useMemo(
-    () => pulls.map((pr) => ({ pr, meta: metaByPr[pr.number] ?? { day: parseDay(pr), reviews: [], reviewers: [], reviewed: false, latestReviewedAt: null, mergedBy: null } })),
+    () =>
+      pulls.map((pr) => ({
+        pr,
+        meta:
+          metaByPr[pr.number] ??
+          {
+            day: parseDay(pr),
+            reviews: [],
+            reviewers: [],
+            reviewed: false,
+            latestReviewedAt: null,
+            mergedBy: null,
+            closedBy: null,
+            closedAt: null,
+          },
+      })),
     [pulls, metaByPr]
   );
 
   const selectedItem = useMemo(() => (selectedPrNumber == null ? null : pullsWithMeta.find((item) => item.pr.number === selectedPrNumber) ?? null), [selectedPrNumber, pullsWithMeta]);
 
+  function selectPrFromList(prNumber: number) {
+    setSelectedPrNumber(prNumber);
+  }
+
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const button = target.closest("button");
+      if (!button) return;
+
+      const explicitPr = button.getAttribute("data-pr-number");
+      const fromText = button.textContent?.match(/#(\d+)/)?.[1];
+      const parsed = Number(explicitPr ?? fromText);
+      if (!Number.isFinite(parsed)) return;
+      if (!pullsWithMeta.some((item) => item.pr.number === parsed)) return;
+
+      setSelectedPrNumber((prev) => (prev === parsed ? prev : parsed));
+    };
+
+    document.addEventListener("click", handler, true);
+    return () => {
+      document.removeEventListener("click", handler, true);
+    };
+  }, [pullsWithMeta]);
+
+  const pendingUnreviewed = useMemo(
+    () => pullsWithMeta.filter((item) => item.pr.state === "open" && !item.meta.reviewed).sort((a, b) => new Date(a.pr.created_at).getTime() - new Date(b.pr.created_at).getTime()),
+    [pullsWithMeta]
+  );
+
+  useEffect(() => {
+    if (pullsWithMeta.length === 0) {
+      setSelectedPrNumber(null);
+      return;
+    }
+
+    if (selectedPrNumber != null && pullsWithMeta.some((item) => item.pr.number === selectedPrNumber)) {
+      return;
+    }
+
+    const defaultPr = pendingUnreviewed[0]?.pr.number ?? pullsWithMeta[0].pr.number;
+    setSelectedPrNumber(defaultPr);
+  }, [pullsWithMeta, selectedPrNumber, pendingUnreviewed]);
+
+  useEffect(() => {
+    setPrCommits([]);
+    setPrFiles([]);
+    setPrDetailError("");
+    setDetailReviews([]);
+    setDetailReviewsError("");
+    setDetailIssueComments([]);
+    setDetailCodeComments([]);
+    setDetailCommentsError("");
+    setReviewTimeline([]);
+    setReviewTimelineError("");
+  }, [selectedPrNumber]);
+
+  const fallbackReviewItems = useMemo(() => {
+    if (!selectedItem) return [] as ReviewTimelineItem[];
+    return selectedItem.meta.reviews
+      .filter(isEffectiveReview)
+      .map((review, index) => ({
+        id: `meta-review-${selectedItem.pr.number}-${review.id ?? index}`,
+        author: review.user?.login ?? "unknown",
+        body: review.body ?? "",
+        at: review.submitted_at ?? selectedItem.meta.latestReviewedAt ?? selectedItem.pr.updated_at,
+        kind: "review" as const,
+        state: review.state,
+      }));
+  }, [selectedItem]);
+
+  useEffect(() => {
+    if (!token || !owner || !repoName || selectedPrNumber == null) {
+      setDetailReviews([]);
+      setDetailReviewsError("");
+      setDetailReviewsLoading(false);
+      setDetailIssueComments([]);
+      setDetailCodeComments([]);
+      setDetailCommentsError("");
+      setDetailCommentsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDetailReviewsLoading(true);
+    setDetailReviewsError("");
+
+    fetchAllPages<GitHubReview>(token, (page) => `/repos/${owner}/${repoName}/pulls/${selectedPrNumber}/reviews?per_page=100&page=${page}`)
+      .then((rows) => {
+        if (cancelled) return;
+        setDetailReviews(rows.filter(isEffectiveReview));
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setDetailReviewsError(e instanceof Error ? e.message : "加载 reviews 失败");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setDetailReviewsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, owner, repoName, selectedPrNumber]);
+
+  useEffect(() => {
+    if (!token || !owner || !repoName || selectedPrNumber == null) {
+      setDetailIssueComments([]);
+      setDetailCodeComments([]);
+      setDetailCommentsError("");
+      setDetailCommentsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDetailCommentsLoading(true);
+    setDetailCommentsError("");
+
+    Promise.allSettled([
+      fetchAllPages<GitHubIssueCommentDetail>(token, (page) => `/repos/${owner}/${repoName}/issues/${selectedPrNumber}/comments?per_page=100&page=${page}`),
+      fetchAllPages<GitHubPullReviewComment>(token, (page) => `/repos/${owner}/${repoName}/pulls/${selectedPrNumber}/comments?per_page=100&page=${page}`),
+    ])
+      .then((results) => {
+        if (cancelled) return;
+        const [issueRes, codeRes] = results;
+
+        const nextIssueComments = issueRes.status === "fulfilled" ? issueRes.value : [];
+        const nextCodeComments = codeRes.status === "fulfilled" ? codeRes.value : [];
+        setDetailIssueComments(nextIssueComments);
+        setDetailCodeComments(nextCodeComments);
+
+        const errors: string[] = [];
+        if (issueRes.status === "rejected") {
+          errors.push(issueRes.reason instanceof Error ? `普通评论加载失败：${issueRes.reason.message}` : "普通评论加载失败");
+        }
+        if (codeRes.status === "rejected") {
+          errors.push(codeRes.reason instanceof Error ? `代码评论加载失败：${codeRes.reason.message}` : "代码评论加载失败");
+        }
+        setDetailCommentsError(errors.join("；"));
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setDetailCommentsError(e instanceof Error ? e.message : "加载 comments 失败");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setDetailCommentsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, owner, repoName, selectedPrNumber]);
+
+  const reviewOnlyItems = useMemo(() => {
+    const rows: ReviewTimelineItem[] = detailReviews.map((review) => ({
+      id: `review-api-${review.id}`,
+      author: review.user?.login ?? "unknown",
+      body: review.body ?? "",
+      at: review.submitted_at ?? selectedItem?.meta.latestReviewedAt ?? selectedItem?.pr.updated_at ?? "",
+      kind: "review" as const,
+      state: review.state,
+    }));
+
+    if (rows.length > 0) {
+      return rows.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    }
+
+    const fallbackRows = [
+      ...fallbackReviewItems,
+      ...reviewTimeline.filter((item) => item.kind === "review"),
+    ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+    const seen = new Set<string>();
+    return fallbackRows.filter((item) => {
+      const key = `${item.author}-${item.state ?? ""}-${item.at}-${normalizeComment(item.body)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [detailReviews, fallbackReviewItems, reviewTimeline, selectedItem]);
+
+  const commentOnlyItems = useMemo(() => {
+    const rows: ReviewTimelineItem[] = [
+      ...detailIssueComments.map((comment) => ({
+        id: `issue-api-${comment.id}`,
+        author: comment.user?.login ?? "unknown",
+        body: comment.body,
+        at: comment.created_at,
+        kind: "issue_comment" as const,
+      })),
+      ...detailCodeComments.map((comment) => ({
+        id: `code-api-${comment.id}`,
+        author: comment.user?.login ?? "unknown",
+        body: comment.body,
+        at: comment.created_at,
+        kind: "code_comment" as const,
+        path: comment.path,
+      })),
+    ];
+
+    if (rows.length > 0) {
+      return rows.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    }
+
+    const fallbackRows = reviewTimeline.filter((item) => item.kind !== "review").sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    const seen = new Set<string>();
+    return fallbackRows.filter((item) => {
+      const key = `${item.kind}-${item.author}-${item.path ?? ""}-${item.at}-${normalizeComment(item.body)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [detailIssueComments, detailCodeComments, reviewTimeline]);
+
   const teacherStats = useMemo(() => {
     const reviewCountMap = new Map<string, number>();
     const contributionMap = new Map<
       string,
-      { total: number; reviewTotal: number; mergeTotal: number; approve: number; requestChanges: number; comment: number; prs: Set<number>; mergedPrs: Set<number> }
+      {
+        total: number;
+        reviewTotal: number;
+        mergeTotal: number;
+        closeTotal: number;
+        approve: number;
+        requestChanges: number;
+        comment: number;
+        prs: Set<number>;
+        mergedPrs: Set<number>;
+        closedPrs: Set<number>;
+      }
     >();
     const pendingQueue = pullsWithMeta.filter((item) => item.pr.state === "open" && !item.meta.reviewed).sort((a, b) => new Date(a.pr.created_at).getTime() - new Date(b.pr.created_at).getTime());
     const historyList = [...pullsWithMeta].sort((a, b) => new Date(b.pr.created_at).getTime() - new Date(a.pr.created_at).getTime());
     const reviewedCount = pullsWithMeta.filter((item) => item.meta.reviewed).length;
     const mergedCount = pullsWithMeta.filter((item) => item.pr.merged_at).length;
+    const closedCount = pullsWithMeta.filter((item) => item.pr.state === "closed" && !item.pr.merged_at).length;
 
     const myReviewedUnmerged: Array<{ item: (typeof pullsWithMeta)[number]; at: string }> = [];
     const myReviewedMerged: Array<{ item: (typeof pullsWithMeta)[number]; at: string }> = [];
+    const myClosedRejected: Array<{ item: (typeof pullsWithMeta)[number]; at: string }> = [];
 
     for (const item of pullsWithMeta) {
       const effective = item.meta.reviews.filter(isEffectiveReview);
@@ -235,11 +530,13 @@ export function App() {
           total: 0,
           reviewTotal: 0,
           mergeTotal: 0,
+          closeTotal: 0,
           approve: 0,
           requestChanges: 0,
           comment: 0,
           prs: new Set<number>(),
           mergedPrs: new Set<number>(),
+          closedPrs: new Set<number>(),
         };
         row.total += 1;
         row.reviewTotal += 1;
@@ -256,11 +553,13 @@ export function App() {
           total: 0,
           reviewTotal: 0,
           mergeTotal: 0,
+          closeTotal: 0,
           approve: 0,
           requestChanges: 0,
           comment: 0,
           prs: new Set<number>(),
           mergedPrs: new Set<number>(),
+          closedPrs: new Set<number>(),
         };
         row.total += 1;
         row.mergeTotal += 1;
@@ -268,12 +567,34 @@ export function App() {
         row.mergedPrs.add(item.pr.number);
         contributionMap.set(mergedBy, row);
       }
+      if (!item.pr.merged_at && item.pr.state === "closed" && item.meta.closedBy) {
+        const closedBy = item.meta.closedBy;
+        const row = contributionMap.get(closedBy) ?? {
+          total: 0,
+          reviewTotal: 0,
+          mergeTotal: 0,
+          closeTotal: 0,
+          approve: 0,
+          requestChanges: 0,
+          comment: 0,
+          prs: new Set<number>(),
+          mergedPrs: new Set<number>(),
+          closedPrs: new Set<number>(),
+        };
+        row.total += 1;
+        row.closeTotal += 1;
+        row.prs.add(item.pr.number);
+        row.closedPrs.add(item.pr.number);
+        contributionMap.set(closedBy, row);
+      }
       if (!currentUser) continue;
       const mine = effective.filter((r) => r.user?.login === currentUser.login && r.submitted_at).sort((a, b) => new Date(b.submitted_at as string).getTime() - new Date(a.submitted_at as string).getTime());
       if (mine.length === 0) continue;
       const latest = mine[0].submitted_at as string;
       if (item.pr.merged_at) {
         myReviewedMerged.push({ item, at: item.pr.merged_at });
+      } else if (item.pr.state === "closed") {
+        myClosedRejected.push({ item, at: item.meta.closedAt ?? latest });
       } else {
         myReviewedUnmerged.push({ item, at: latest });
       }
@@ -286,17 +607,20 @@ export function App() {
         total: row.total,
         reviewTotal: row.reviewTotal,
         mergeTotal: row.mergeTotal,
+        closeTotal: row.closeTotal,
         approve: row.approve,
         requestChanges: row.requestChanges,
         comment: row.comment,
         coveredPrs: row.prs.size,
         mergedFollowUps: row.mergedPrs.size,
+        closedFollowUps: row.closedPrs.size,
       }))
       .sort((a, b) => b.total - a.total || b.coveredPrs - a.coveredPrs);
     myReviewedUnmerged.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
     myReviewedMerged.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    myClosedRejected.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
 
-    return { pendingQueue, historyList, reviewedCount, mergedCount, teacherRows, contributionRows, myReviewedUnmerged, myReviewedMerged };
+    return { pendingQueue, historyList, reviewedCount, mergedCount, closedCount, teacherRows, contributionRows, myReviewedUnmerged, myReviewedMerged, myClosedRejected };
   }, [pullsWithMeta, currentUser]);
 
   const learnerStats = useMemo(() => {
@@ -375,6 +699,189 @@ export function App() {
 
   const selectedLearnerRow = useMemo(() => (selectedLearner ? learnerStats.rows.find((r) => r.github === selectedLearner) ?? null : null), [selectedLearner, learnerStats.rows]);
 
+  const selectedReviewItems = useMemo<ReviewTimelineItem[]>(() => {
+    const reviewRows = detailReviews
+      .filter(isEffectiveReview)
+      .map<ReviewTimelineItem>((review) => ({
+        id: `review-${review.id}`,
+        author: review.user?.login ?? "unknown",
+        body: review.body ?? "",
+        at: review.submitted_at ?? "",
+        kind: "review",
+        state: review.state,
+      }))
+      .filter((row) => row.at);
+
+    if (reviewTimeline.length > 0) {
+      const hasReviewRow = reviewTimeline.some((item) => item.kind === "review");
+      if (hasReviewRow) return reviewTimeline;
+      return [...reviewRows, ...reviewTimeline].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    }
+
+    if (reviewRows.length > 0) return reviewRows;
+    if (!selectedItem) return [];
+    return selectedItem!.meta.reviews
+      .filter(isEffectiveReview)
+      .map<ReviewTimelineItem>((review) => ({
+        id: `review-${review.id}`,
+        author: review.user?.login ?? "unknown",
+        body: review.body ?? "",
+        at: review.submitted_at ?? "",
+        kind: "review" as const,
+        state: review.state,
+      }))
+      .filter((item) => item.body.trim().length > 0 || item.state);
+  }, [reviewTimeline, selectedItem, detailReviews]);
+
+  useEffect(() => {
+    if (teacherStats.pendingQueue.length === 0) return;
+    const selectedStillPending = teacherStats.pendingQueue.some((item) => item.pr.number === selectedPrNumber);
+    if (!selectedStillPending) {
+      setSelectedPrNumber(teacherStats.pendingQueue[0].pr.number);
+    }
+  }, [teacherStats.pendingQueue, selectedPrNumber]);
+
+  useEffect(() => {
+    if (!token || !owner || !repoName || !selectedItem) {
+      setReviewTimeline([]);
+      setReviewTimelineError("");
+      return;
+    }
+    const prNumber = selectedItem.pr.number;
+    let cancelled = false;
+    setReviewTimelineLoading(true);
+    setReviewTimelineError("");
+
+    Promise.all([
+      githubFetch<GitHubReview[]>(token, `/repos/${owner}/${repoName}/pulls/${prNumber}/reviews?per_page=100`),
+      githubFetch<GitHubIssueCommentDetail[]>(token, `/repos/${owner}/${repoName}/issues/${prNumber}/comments?per_page=100`),
+      githubFetch<GitHubPullReviewComment[]>(token, `/repos/${owner}/${repoName}/pulls/${prNumber}/comments?per_page=100`),
+    ])
+      .then(([reviews, issueComments, codeComments]) => {
+        if (cancelled) return;
+        const items: ReviewTimelineItem[] = [];
+        for (const review of reviews.filter(isEffectiveReview)) {
+          items.push({
+            id: `review-${review.id}`,
+            author: review.user?.login ?? "unknown",
+            body: review.body ?? "",
+            at: review.submitted_at ?? "",
+            kind: "review",
+            state: review.state,
+          });
+        }
+        for (const comment of issueComments) {
+          items.push({
+            id: `issue-${comment.id}`,
+            author: comment.user?.login ?? "unknown",
+            body: comment.body ?? "",
+            at: comment.created_at,
+            kind: "issue_comment",
+          });
+        }
+        for (const comment of codeComments) {
+          items.push({
+            id: `code-${comment.id}`,
+            author: comment.user?.login ?? "unknown",
+            body: comment.body ?? "",
+            at: comment.created_at,
+            kind: "code_comment",
+            path: comment.path,
+          });
+        }
+
+        items.sort((a, b) => new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime());
+        setReviewTimeline(items.filter((item) => item.body.trim().length > 0 || item.state));
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setReviewTimeline([]);
+        setReviewTimelineError(e instanceof Error ? e.message : "加载批注记录失败");
+      })
+      .finally(() => {
+        if (!cancelled) setReviewTimelineLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, owner, repoName, selectedItem]);
+
+  useEffect(() => {
+    const syncDayHint = (headingText: string, rows: Array<{ item: (typeof pullsWithMeta)[number] }>) => {
+      const heading = Array.from(document.querySelectorAll("h3")).find((el) => el.textContent?.includes(headingText));
+      const card = heading?.closest(".rounded-2xl") as HTMLElement | null;
+      if (!card) return;
+      const buttons = [...card.querySelectorAll("button")];
+      buttons.forEach((button, index) => {
+        const day = rows[index]?.item.meta.day;
+        let tag = button.querySelector<HTMLElement>('[data-day-hint="true"]');
+        if (!tag) {
+          tag = document.createElement("p");
+          tag.dataset.dayHint = "true";
+          tag.className = "text-[11px] text-[var(--text-soft)]";
+          button.appendChild(tag);
+        }
+        tag.textContent = day ? `识别：Day${day}` : "识别：未识别Day";
+      });
+    };
+
+    syncDayHint("我已批改未合并通过", teacherStats.myReviewedUnmerged);
+    syncDayHint("我已批改已合并通过", teacherStats.myReviewedMerged);
+  }, [teacherStats.myReviewedMerged, teacherStats.myReviewedUnmerged, pullsWithMeta]);
+
+  useEffect(() => {
+    const workloadHeading = Array.from(document.querySelectorAll("h3")).find((el) => el.textContent?.includes("协作工作量统计"));
+    const workloadCard = workloadHeading?.closest(".rounded-2xl") as HTMLElement | null;
+    if (workloadCard && workloadHeading) {
+      let workloadClosedRow = workloadCard.querySelector<HTMLElement>('[data-extra-stat="closed-pr-workload"]');
+      if (!workloadClosedRow) {
+        workloadClosedRow = document.createElement("p");
+        workloadClosedRow.dataset.extraStat = "closed-pr-workload";
+        workloadClosedRow.className = "mt-1 text-xs";
+        workloadHeading.insertAdjacentElement("afterend", workloadClosedRow);
+      }
+      workloadClosedRow.innerHTML = `已关闭PR：<b>${teacherStats.closedCount}</b>`;
+    }
+
+    const contributionHeading = Array.from(document.querySelectorAll("h3")).find((el) => el.textContent?.includes("已有产出的助教列表"));
+    const contributionCard = contributionHeading?.closest(".rounded-2xl") as HTMLElement | null;
+    const closeOps = teacherStats.contributionRows.reduce((sum, row) => sum + row.closeTotal, 0);
+    const closePrs = teacherStats.contributionRows.reduce((sum, row) => sum + row.closedFollowUps, 0);
+    if (contributionCard && contributionHeading) {
+      let contributionClosedRow = contributionCard.querySelector<HTMLElement>('[data-extra-stat="closed-pr-contribution"]');
+      if (!contributionClosedRow) {
+        contributionClosedRow = document.createElement("p");
+        contributionClosedRow.dataset.extraStat = "closed-pr-contribution";
+        contributionClosedRow.className = "mt-1 text-xs text-[var(--text-soft)]";
+        contributionHeading.insertAdjacentElement("afterend", contributionClosedRow);
+      }
+      contributionClosedRow.innerHTML = `已关闭PR产出：<b>${closeOps}</b> 次操作，覆盖 <b>${closePrs}</b> 个PR`;
+    }
+  }, [teacherStats.closedCount, teacherStats.contributionRows]);
+
+  useEffect(() => {
+    const assistantHeading = Array.from(document.querySelectorAll("h2")).find((el) => el.textContent?.includes("助教批改区域"));
+    const assistantSection = assistantHeading?.closest("section") ?? null;
+    const container = assistantSection?.querySelector<HTMLElement>(".space-y-3, .grid.gap-3") ?? null;
+    if (!container) return;
+    const children = Array.from(container.children) as HTMLElement[];
+    const closeCard = children.find((card) => card.querySelector("h3")?.textContent?.includes("我已关闭拒绝"));
+    const workloadCard = children.find((card) => card.querySelector("h3")?.textContent?.includes("协作工作量统计"));
+    if (!closeCard || !workloadCard) return;
+
+    const closeIndex = children.indexOf(closeCard);
+    const workloadIndex = children.indexOf(workloadCard);
+    if (closeIndex < workloadIndex) return;
+
+    const closePlaceholder = document.createElement("div");
+    const workloadPlaceholder = document.createElement("div");
+    container.replaceChild(closePlaceholder, closeCard);
+    container.replaceChild(workloadPlaceholder, workloadCard);
+    container.replaceChild(closeCard, workloadPlaceholder);
+    container.replaceChild(workloadCard, closePlaceholder);
+  }, [teacherStats.pendingQueue.length, teacherStats.reviewedCount, teacherStats.closedCount]);
+
   async function copyText(text: string, filename: string) {
     if (!text) return;
     try {
@@ -383,6 +890,55 @@ export function App() {
       window.setTimeout(() => setCopiedFile(""), 1500);
     } catch {
       setError("复制失败，请检查浏览器是否允许剪贴板权限。");
+    }
+  }
+
+  async function handleReviewAction(action: ReviewAction) {
+    if (!token || !owner || !repoName || selectedPrNumber == null) {
+      setError("请先登录并选择 PR");
+      return;
+    }
+    if (!draftComment.trim()) {
+      setError("请先填写批注内容");
+      return;
+    }
+    setSubmitting(true);
+    setError("");
+    try {
+      const reviewEvent = action === "APPROVE" ? "APPROVE" : "COMMENT";
+      await githubFetch(token, `/repos/${owner}/${repoName}/pulls/${selectedPrNumber}/reviews`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: draftComment.trim(), event: reviewEvent }),
+      });
+
+      if (action === "APPROVE") {
+        await githubFetch(token, `/repos/${owner}/${repoName}/pulls/${selectedPrNumber}/merge`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ merge_method: "squash" }),
+        });
+      }
+
+      if (action === "REQUEST_CHANGES") {
+        await githubFetch(token, `/repos/${owner}/${repoName}/pulls/${selectedPrNumber}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state: "closed" }),
+        });
+      }
+
+      setDraftComment("");
+      await loadDashboard(token, repo);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "提交失败";
+      if (message.includes("422")) {
+        setError("该 PR 可能刚被其他老师处理，建议刷新后重试。");
+      } else {
+        setError(message);
+      }
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -424,14 +980,14 @@ export function App() {
         const rows = await Promise.allSettled(
           batch.map(async (pr) => {
             const reviews = await githubFetch<GitHubReview[]>(authToken, `/repos/${repoOwner}/${repoInner}/pulls/${pr.number}/reviews?per_page=100`);
-            const mergedBy = pr.merged_at ? await fetchMergedBy(authToken, repoOwner, repoInner, pr.number) : null;
-            return { reviews, mergedBy };
+            const actors = pr.state === "closed" ? await fetchPrActors(authToken, repoOwner, repoInner, pr.number) : { mergedBy: null, closedBy: null, closedAt: null };
+            return { reviews, actors };
           })
         );
         rows.forEach((row, idx) => {
           const pr = batch[idx];
           const reviews = row.status === "fulfilled" ? row.value.reviews : [];
-          const mergedBy = row.status === "fulfilled" ? row.value.mergedBy : null;
+          const actors = row.status === "fulfilled" ? row.value.actors : { mergedBy: null, closedBy: null, closedAt: null };
           const effective = reviews.filter(isEffectiveReview);
           meta[pr.number] = {
             day: parseDay(pr),
@@ -439,7 +995,9 @@ export function App() {
             reviewers: [...new Set(effective.map((r) => r.user?.login).filter(Boolean) as string[])],
             reviewed: effective.length > 0,
             latestReviewedAt: latestReviewAt(reviews),
-            mergedBy,
+            mergedBy: actors.mergedBy,
+            closedBy: actors.closedBy,
+            closedAt: actors.closedAt,
           };
         });
       }
@@ -536,6 +1094,7 @@ export function App() {
     setDraftComment((prev) => (prev.trim() ? `${prev.trim()}\n${text}` : text));
   }
   async function submitReview(action: ReviewAction) {
+    return handleReviewAction(action);
     if (!selectedItem || !token || !owner || !repoName) return;
     setSubmitting(true);
     setError("");
@@ -607,12 +1166,12 @@ export function App() {
             <p className="text-xs text-[var(--text-soft)]">协作规则：只要有批改记录，就不在待批改中出现。</p>
           </div>
           <div className="grid gap-4 xl:grid-cols-[1.1fr_1.7fr]">
-            <div className="space-y-3">
+            <div className="flex flex-col gap-3">
               <div className="rounded-2xl border border-[var(--line)] bg-white/85 p-3">
                 <h3 className="text-sm font-bold">待批改 PR（无人批注）</h3>
                 <div className="mt-2 max-h-40 space-y-1 overflow-auto text-xs">
                   {teacherStats.pendingQueue.map((item) => (
-                    <button key={item.pr.number} onClick={() => setSelectedPrNumber(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                    <button key={item.pr.number} onClick={() => selectPrFromList(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
                       #{item.pr.number} @{item.pr.user.login} · {item.meta.day ? `Day${item.meta.day}` : "未识别Day"}
                     </button>
                   ))}
@@ -624,7 +1183,7 @@ export function App() {
                 <h3 className="text-sm font-bold">我已批改未合并通过</h3>
                 <div className="mt-2 max-h-40 space-y-1 overflow-auto text-xs">
                   {teacherStats.myReviewedUnmerged.map(({ item, at }) => (
-                    <button key={item.pr.number} onClick={() => setSelectedPrNumber(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                    <button key={item.pr.number} onClick={() => selectPrFromList(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
                       #{item.pr.number} @{item.pr.user.login} · 批改于 {formatDate(at)}
                     </button>
                   ))}
@@ -636,7 +1195,7 @@ export function App() {
                 <h3 className="text-sm font-bold">我已批改已合并通过</h3>
                 <div className="mt-2 max-h-40 space-y-1 overflow-auto text-xs">
                   {teacherStats.myReviewedMerged.map(({ item, at }) => (
-                    <button key={item.pr.number} onClick={() => setSelectedPrNumber(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                    <button key={item.pr.number} onClick={() => selectPrFromList(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
                       #{item.pr.number} @{item.pr.user.login} · 合并于 {formatDate(at)}
                     </button>
                   ))}
@@ -657,7 +1216,7 @@ export function App() {
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-[var(--line)] bg-white/85 p-3">
+              <div className="order-5 rounded-2xl border border-[var(--line)] bg-white/85 p-3">
                 <h3 className="text-sm font-bold">已有产出的助教列表（贡献情况）</h3>
                 <p className="mt-1 text-xs text-[var(--text-soft)]">按总批改次数排序，帮助快速了解各位助教的贡献分布。</p>
                 <div className="mt-2 max-h-56 space-y-1 overflow-auto text-xs">
@@ -671,10 +1230,26 @@ export function App() {
                   {teacherStats.contributionRows.length === 0 ? <p className="text-[var(--text-soft)]">暂无助教批改产出。</p> : null}
                 </div>
               </div>
+
+              <div className="order-4 rounded-2xl border border-[var(--line)] bg-white/85 p-3">
+                <h3 className="text-sm font-bold">我已关闭拒绝（我操作的 Close PR）</h3>
+                <div className="mt-2 max-h-44 space-y-1 overflow-auto text-xs">
+                  {teacherStats.myClosedRejected.map(({ item, at }) => (
+                    <button key={item.pr.number} onClick={() => selectPrFromList(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>#{item.pr.number} @{item.pr.user.login}</span>
+                        <span className="rounded-full bg-slate-200 px-2 py-0.5 text-slate-700">已关闭</span>
+                      </div>
+                      <p className="text-[11px] text-[var(--text-soft)]">{item.meta.day ? `Day${item.meta.day}` : "未识别Day"} · 关闭时间 {formatDate(at)}</p>
+                    </button>
+                  ))}
+                  {teacherStats.myClosedRejected.length === 0 ? <p className="text-[var(--text-soft)]">你还没有关闭拒绝记录。</p> : null}
+                </div>
+              </div>
             </div>
 
             <div className="space-y-3">
-              <div className="rounded-2xl border border-[var(--line)] bg-white/85 p-3">
+              <div key={selectedPrNumber ?? "no-pr"} className="rounded-2xl border border-[var(--line)] bg-white/85 p-3">
                 <h3 className="text-sm font-bold">PR 详情与批改</h3>
                 {!selectedItem ? (
                   <p className="mt-2 text-xs text-[var(--text-soft)]">请选择左侧任意 PR。</p>
@@ -687,18 +1262,55 @@ export function App() {
                     </div>
                     <p className="mt-1 text-xs text-[var(--text-soft)]">创建 {formatDate(selectedItem.pr.created_at)} · {selectedItem.meta.day ? `Day${selectedItem.meta.day}` : "未识别Day"}</p>
                     <a className="text-xs text-sky-700 underline" href={selectedItem.pr.html_url} target="_blank" rel="noreferrer">{selectedItem.pr.html_url}</a>
+                    <span className="hidden">{effectiveReviews.length}</span>
 
                     <div className="mt-3 rounded-xl border border-[var(--line)] p-2">
-                      <p className="text-xs font-semibold">已有批注记录</p>
-                      <div className="mt-1 max-h-28 space-y-1 overflow-auto text-xs">
-                        {effectiveReviews.map((review) => (
-                          <div key={review.id} className="rounded-md bg-[var(--bg-paper)]/70 px-2 py-1">
-                            <p>@{review.user?.login ?? "unknown"} · {review.state} · {formatDate(review.submitted_at)}</p>
-                            {review.body ? <p className="mt-0.5 whitespace-pre-wrap text-[11px]">{review.body}</p> : null}
+                      <p className="text-xs font-semibold">已有批注记录（Reviews / Comments 分开展示）</p>
+                      {reviewTimelineLoading ? <p className="mt-1 text-xs text-[var(--text-soft)]">正在加载批注记录...</p> : null}
+                      {reviewTimelineError ? <p className="mt-1 text-xs text-rose-700">{reviewTimelineError}</p> : null}
+                      {detailReviewsLoading ? <p className="mt-1 text-xs text-[var(--text-soft)]">正在加载 reviews 详情...</p> : null}
+                      {detailReviewsError ? <p className="mt-1 text-xs text-rose-700">{detailReviewsError}</p> : null}
+                      {detailCommentsLoading ? <p className="mt-1 text-xs text-[var(--text-soft)]">正在加载 comments 详情...</p> : null}
+                      {detailCommentsError ? <p className="mt-1 text-xs text-rose-700">{detailCommentsError}</p> : null}
+                      <div className="mt-2 grid gap-2 md:grid-cols-2">
+                        <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-paper)]/60 p-2">
+                          <p className="text-xs font-semibold">Reviews（审核记录）</p>
+                          <div className="mt-1 max-h-24 space-y-1 overflow-auto text-xs">
+                            {reviewOnlyItems.map((review) => (
+                              <div key={review.id} className="rounded-md bg-white/80 px-2 py-1">
+                                <p>
+                                  @{review.author} · {review.state ? `${review.state} · ` : ""}{formatDate(review.at)}
+                                </p>
+                                {review.body ? <p className="mt-0.5 whitespace-pre-wrap text-[11px]">{review.body}</p> : null}
+                              </div>
+                            ))}
+                            {reviewOnlyItems.length === 0 ? <p className="text-[var(--text-soft)]">暂无 reviews 记录。</p> : null}
                           </div>
-                        ))}
-                        {effectiveReviews.length === 0 ? <p className="text-[var(--text-soft)]">暂无批注。</p> : null}
+                        </div>
+
+                        <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-paper)]/60 p-2">
+                          <p className="text-xs font-semibold">Comments（评论记录）</p>
+                          <div className="mt-1 max-h-24 space-y-1 overflow-auto text-xs">
+                            {commentOnlyItems.map((comment) => (
+                              <div key={comment.id} className="rounded-md bg-white/80 px-2 py-1">
+                                <p>
+                                  @{comment.author} · {reviewKindLabel(comment.kind)} · {formatDate(comment.at)}
+                                  {comment.path ? ` · ${comment.path}` : ""}
+                                </p>
+                                {comment.body ? <p className="mt-0.5 whitespace-pre-wrap text-[11px]">{comment.body}</p> : null}
+                              </div>
+                            ))}
+                            {commentOnlyItems.length === 0 ? <p className="text-[var(--text-soft)]">暂无 comments 记录。</p> : null}
+                          </div>
+                        </div>
                       </div>
+
+                      {reviewOnlyItems.length === 0 && commentOnlyItems.length === 0 && selectedItem?.meta.reviewed ? (
+                        <p className="mt-2 text-xs text-[var(--text-soft)]">该 PR 已存在批改状态，但 GitHub 未返回可展开详情。批改老师：{selectedItem?.meta.reviewers.map((x) => `@${x}`).join(", ") || "--"}，最近时间：{formatDate(selectedItem?.meta.latestReviewedAt)}。</p>
+                      ) : null}
+                      {reviewOnlyItems.length === 0 && commentOnlyItems.length === 0 && !selectedItem?.meta.reviewed ? (
+                        <p className="mt-2 text-xs text-[var(--text-soft)]">暂无批注。</p>
+                      ) : null}
                     </div>
 
                     <div className="mt-3 rounded-xl border border-[var(--line)] p-2">
@@ -766,7 +1378,9 @@ export function App() {
                         <p className="mt-2 text-[11px] text-[var(--text-soft)]">鼠标悬停按钮可查看操作区别说明，帮助不熟悉 GitHub 的助教快速理解。</p>
                         <div className="mt-2 flex flex-wrap gap-2">
                           <button
-                            onClick={() => submitReview("APPROVE")}
+                            onClick={() => {
+                              submitReview("APPROVE");
+                            }}
                             disabled={submitting}
                             title={reviewActionTips.APPROVE}
                             aria-label={reviewActionTips.APPROVE}
@@ -775,16 +1389,20 @@ export function App() {
                             批注并通过
                           </button>
                           <button
-                            onClick={() => submitReview("REQUEST_CHANGES")}
+                            onClick={() => {
+                              submitReview("REQUEST_CHANGES");
+                            }}
                             disabled={submitting}
                             title={reviewActionTips.REQUEST_CHANGES}
                             aria-label={reviewActionTips.REQUEST_CHANGES}
                             className="rounded-lg bg-orange-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
                           >
-                            请求修改
+                            关闭PR
                           </button>
                           <button
-                            onClick={() => submitReview("COMMENT")}
+                            onClick={() => {
+                              submitReview("COMMENT");
+                            }}
                             disabled={submitting}
                             title={reviewActionTips.COMMENT}
                             aria-label={reviewActionTips.COMMENT}
@@ -805,12 +1423,13 @@ export function App() {
                 <h3 className="text-sm font-bold">历史总 PR 列表（提交时间倒序）</h3>
                 <div className="mt-2 max-h-56 space-y-1 overflow-auto text-xs">
                   {teacherStats.historyList.map((item) => (
-                    <button key={item.pr.number} onClick={() => setSelectedPrNumber(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                    <button key={item.pr.number} onClick={() => selectPrFromList(item.pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
                       <div className="flex items-center justify-between gap-2">
                         <span>#{item.pr.number} @{item.pr.user.login}</span>
                         <div className="flex items-center gap-1">
                           {item.meta.reviewed ? <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-800">已批改</span> : null}
                           {item.pr.merged_at ? <span className="rounded-full bg-blue-100 px-2 py-0.5 text-blue-800">已合并</span> : null}
+                          {item.pr.state === "closed" && !item.pr.merged_at ? <span className="rounded-full bg-slate-200 px-2 py-0.5 text-slate-700">已关闭</span> : null}
                         </div>
                       </div>
                       <p className="text-[11px] text-[var(--text-soft)]">提交 {formatDate(item.pr.created_at)}</p>
@@ -893,7 +1512,7 @@ export function App() {
                   {(selectedLearnerRow?.pulls ?? []).map(({ pr, meta }) => {
                     const dayStatus = meta.day ? (new Date(pr.created_at).getTime() <= getWeekDeadline(meta.day).getTime() ? "准时" : "逾期") : "未识别Day";
                     return (
-                      <button key={pr.number} onClick={() => setSelectedPrNumber(pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
+                      <button key={pr.number} onClick={() => selectPrFromList(pr.number)} className="block w-full rounded-md border border-[var(--line)] px-2 py-1 text-left hover:bg-amber-50">
                         <div className="flex items-center justify-between gap-2">
                           <span>#{pr.number} · {meta.day ? `Day${meta.day}` : "Day?"}</span>
                           <div className="flex items-center gap-1">
