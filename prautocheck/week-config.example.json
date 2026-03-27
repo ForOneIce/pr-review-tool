@@ -1,0 +1,9 @@
+{
+  "weeks": [
+    { "id": "week1", "startDay": 1, "endDay": 7, "deadline": "2026-03-09T00:00:00+08:00" },
+    { "id": "week2", "startDay": 8, "endDay": 14, "deadline": "2026-03-16T00:00:00+08:00" },
+    { "id": "week3", "startDay": 15, "endDay": 21, "deadline": "2026-03-23T00:00:00+08:00" },
+    { "id": "week4", "startDay": 22, "endDay": 28, "deadline": "2026-03-30T00:00:00+08:00" },
+    { "id": "week5", "startDay": 29, "endDay": 30, "deadline": "2026-04-01T00:00:00+08:00" }
+  ]
+}

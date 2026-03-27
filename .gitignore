@@ -1,0 +1,31 @@
+## Node / Vite
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+## Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+## Local env
+.env
+.env.*
+
+## Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+## Generated reports (this repo)
+prautocheck/reports/
+prautocheck/reports/task-logs/
+prautocheck/reports/**/*.xlsx
+prautocheck/reports/**/*.csv
+
+## Local notes / temp
+prautocheck/need
