@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { throwOnGhFailure, logGhFatalError } from "./gh-error-format.mjs";
+import { spawnGh } from "./gh-runner.mjs";
 import readline from "node:readline/promises";
 
 const DEFAULT_REPO = "0xherstory/WWW6.5";
@@ -68,20 +69,21 @@ function parsePrList(raw) {
 }
 
 function runGh(args, input = null) {
-  const ghBin =
-    process.platform === "win32" && fs.existsSync("C:\\Program Files\\GitHub CLI\\gh.exe")
-      ? "C:\\Program Files\\GitHub CLI\\gh.exe"
-      : "gh";
-  const result = spawnSync(ghBin, args, {
-    input,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    const stderr = (result.stderr || "").trim();
-    const stdout = (result.stdout || "").trim();
-    throw new Error([stderr, stdout].filter(Boolean).join(" | ") || "gh command failed");
+  const result = spawnGh(args, input);
+  if (result.error) {
+    throw new Error(`无法启动 gh (${result.ghBin}): ${result.error.message}`);
   }
-  return (result.stdout || "").trim();
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || "").trim();
+    const stdout = String(result.stdout || "").trim();
+    throwOnGhFailure(stderr, stdout, {
+      exitCode: result.status,
+      signal: result.signal ?? null,
+      ghBin: result.ghBin,
+      ghArgs: [...args],
+    });
+  }
+  return String(result.stdout || "").trim();
 }
 
 function ghApi(pathAndQuery, method = "GET", body = null) {
@@ -219,7 +221,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
+  logGhFatalError(err);
   process.exit(1);
 });
 

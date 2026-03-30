@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import readline from "node:readline/promises";
 import process from "node:process";
 import * as XLSX from "xlsx";
 import solc from "solc";
+import { throwOnGhFailure, logGhFatalError } from "./gh-error-format.mjs";
+import { spawnGh } from "./gh-runner.mjs";
 
 const COMMENT_PREFIX = "[脚本审核建议] ";
 const DEFAULT_REPO = "0xherstory/WWW6.5";
@@ -48,20 +49,21 @@ function parseArgs(argv) {
 }
 
 function runGh(args, input = null) {
-  const ghBin =
-    process.platform === "win32" && fs.existsSync("C:\\Program Files\\GitHub CLI\\gh.exe")
-      ? "C:\\Program Files\\GitHub CLI\\gh.exe"
-      : "gh";
-  const result = spawnSync(ghBin, args, {
-    input,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    const stderr = (result.stderr || "").trim();
-    const stdout = (result.stdout || "").trim();
-    throw new Error(`gh 命令失败: ${[stderr, stdout].filter(Boolean).join(" | ") || "unknown error"}`);
+  const result = spawnGh(args, input);
+  if (result.error) {
+    throw new Error(`无法启动 gh (${result.ghBin}): ${result.error.message}`);
   }
-  return (result.stdout || "").trim();
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || "").trim();
+    const stdout = String(result.stdout || "").trim();
+    throwOnGhFailure(stderr, stdout, {
+      exitCode: result.status,
+      signal: result.signal ?? null,
+      ghBin: result.ghBin,
+      ghArgs: [...args],
+    });
+  }
+  return String(result.stdout || "").trim();
 }
 
 /** 判断是否为网络/API 异常（连接失败等），此类异常应对该 PR 不做任何处理，留待下次任务重试 */
@@ -948,7 +950,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
+  logGhFatalError(err);
   process.exit(1);
 });
 
